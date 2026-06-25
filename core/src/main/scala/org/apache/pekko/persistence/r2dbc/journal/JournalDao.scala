@@ -78,6 +78,61 @@ private[r2dbc] object JournalDao {
     }
   }
 
+  /**
+   * Lowercase hex encoding of a `bytea` payload. Used by the UNNEST-based batch insert to pass binary payloads through
+   * a `text[]` array parameter (the r2dbc-postgresql array codec does not support `bytea[]`), decoded back to `bytea`
+   * in SQL with `decode(?, 'hex')`.
+   */
+  private[journal] def toHex(bytes: Array[Byte]): String = {
+    val hex = new Array[Char](bytes.length * 2)
+    var i = 0
+    while (i < bytes.length) {
+      val b = bytes(i) & 0xFF
+      hex(i * 2) = Character.forDigit(b >>> 4, 16)
+      hex(i * 2 + 1) = Character.forDigit(b & 0x0F, 16)
+      i += 1
+    }
+    new String(hex)
+  }
+
+  /**
+   * Encode a set of tags as a JSON array string, e.g. `["a","b"]`. Used by the UNNEST-based batch insert because a
+   * per-row `text[]` column cannot be expressed as a (ragged) multi-dimensional array parameter; the JSON `text[]` is
+   * rebuilt into a `text[]` per row in SQL with `jsonb_array_elements_text`.
+   */
+  private[journal] def tagsToJsonArray(tags: Set[String]): String = {
+    val sb = new java.lang.StringBuilder()
+    sb.append('[')
+    var first = true
+    tags.foreach { tag =>
+      if (!first) sb.append(',')
+      first = false
+      appendJsonString(sb, tag)
+    }
+    sb.append(']')
+    sb.toString
+  }
+
+  private def appendJsonString(sb: java.lang.StringBuilder, s: String): Unit = {
+    sb.append('"')
+    var i = 0
+    while (i < s.length) {
+      s.charAt(i) match {
+        case '"'           => sb.append("\\\"")
+        case '\\'          => sb.append("\\\\")
+        case '\n'          => sb.append("\\n")
+        case '\r'          => sb.append("\\r")
+        case '\t'          => sb.append("\\t")
+        case '\b'          => sb.append("\\b")
+        case '\f'          => sb.append("\\f")
+        case c if c < 0x20 => sb.append("\\u%04x".format(c.toInt))
+        case c             => sb.append(c)
+      }
+      i += 1
+    }
+    sb.append('"')
+  }
+
   def fromConfig(
       settings: JournalSettings,
       config: Config
@@ -149,6 +204,40 @@ private[r2dbc] class JournalDao(val settings: JournalSettings, connectionFactory
 
     (insertEventWithParameterTimestampSql, insertEventWithTransactionTimestampSql)
   }
+
+  /**
+   * Insert statement used by [[writeEventsInBatch]] to write rows for possibly different persistenceIds in one `add()`
+   * batch. The `db_timestamp` is always supplied as a parameter (application timestamp) and there is no per-row
+   * timestamp subselect, so there is nothing to return.
+   */
+  protected val insertEventBatchSql: String = sql"""
+    INSERT INTO $journalTable
+    (slice, entity_type, persistence_id, seq_nr, writer, adapter_manifest, event_ser_id, event_ser_manifest, event_payload, tags, meta_ser_id, meta_ser_manifest, meta_payload, db_timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+  /**
+   * Prototype alternative to [[insertEventBatchSql]] that inserts the whole coalesced batch with a single
+   * `UNNEST`-based multi-row statement (one execution instead of one prepared-statement execution per row). Selected
+   * by [[StreamBatchedWriteJournal]] when `batch.use-unnest = on`; only valid for the postgres and yugabyte dialects
+   * with `bytea` payloads.
+   *
+   * Each column is supplied as a parallel array parameter. `bytea` payloads are passed as lowercase hex `text[]` and
+   * decoded in SQL (the r2dbc-postgresql array codec does not support `bytea[]`). The per-row `tags text[]` - which
+   * cannot be expressed as a ragged multi-dimensional array parameter - is passed as a JSON `text[]` and rebuilt with
+   * `jsonb_array_elements_text`. `lazy` so it is only interpolated when the postgres/yugabyte UNNEST path is used.
+   */
+  protected lazy val insertEventBatchUnnestSql: String = sql"""
+    INSERT INTO $journalTable
+    (slice, entity_type, persistence_id, seq_nr, writer, adapter_manifest, event_ser_id, event_ser_manifest, event_payload, tags, meta_ser_id, meta_ser_manifest, meta_payload, db_timestamp)
+    SELECT
+      d.slice, d.entity_type, d.persistence_id, d.seq_nr, d.writer, d.adapter_manifest, d.event_ser_id, d.event_ser_manifest,
+      decode(d.event_payload_hex, 'hex'),
+      CASE WHEN d.tags_json IS NULL THEN NULL ELSE ARRAY(SELECT jsonb_array_elements_text(d.tags_json::jsonb)) END,
+      d.meta_ser_id, d.meta_ser_manifest,
+      CASE WHEN d.meta_payload_hex IS NULL THEN NULL ELSE decode(d.meta_payload_hex, 'hex') END,
+      d.db_timestamp::timestamptz
+    FROM unnest(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      AS d(slice, entity_type, persistence_id, seq_nr, writer, adapter_manifest, event_ser_id, event_ser_manifest, event_payload_hex, tags_json, meta_ser_id, meta_ser_manifest, meta_payload_hex, db_timestamp)"""
 
   private val deleteEventsSql = sql"""
     DELETE FROM $journalTable
@@ -271,6 +360,149 @@ private[r2dbc] class JournalDao(val settings: JournalSettings, connectionFactory
         result.map(_ => events.head.dbTimestamp)(ExecutionContext.parasitic)
       }
     }
+  }
+
+  /**
+   * Write events that may belong to *different* persistenceIds in a single statement (one `add()` batch in one
+   * transaction). This is used by [[StreamBatchedWriteJournal]] to coalesce concurrent writes from many entities into
+   * a single database round-trip.
+   *
+   * In contrast to [[writeEvents]] this requires application timestamps (`use-app-timestamp = on`) and monotonically
+   * increasing timestamps (`db-timestamp-monotonic-increasing = on`) so that each row carries its own `db_timestamp`
+   * and no per-persistenceId timestamp subselect is needed. Those requirements are enforced when the
+   * [[StreamBatchedWriteJournal]] starts. No timestamp is returned because the rows can belong to different
+   * persistenceIds.
+   */
+  def writeEventsInBatch(events: Seq[SerializedJournalRow]): Future[Unit] = {
+    require(events.nonEmpty)
+
+    def bind(stmt: Statement, write: SerializedJournalRow): Statement = {
+      stmt
+        .bind(0, write.slice)
+        .bind(1, write.entityType)
+        .bind(2, write.persistenceId)
+        .bind(3, write.seqNr)
+        .bind(4, write.writerUuid)
+        .bind(5, "") // FIXME event adapter
+        .bind(6, write.serId)
+        .bind(7, write.serManifest)
+        .bindPayload(8, write.payload.get)
+
+      bindTagsForWrite(stmt, write.tags, 9)
+
+      write.metadata match {
+        case Some(m) =>
+          stmt
+            .bind(10, m.serId)
+            .bind(11, m.serManifest)
+            .bind(12, m.payload)
+        case None =>
+          stmt
+            .bindNull(10, classOf[Integer])
+            .bindNull(11, classOf[String])
+            .bindNull(12, classOf[Array[Byte]])
+      }
+
+      stmt.bind(13, write.dbTimestamp)
+    }
+
+    val result = r2dbcExecutor.updateInBatch(s"batch insert [${events.size}] events")(connection =>
+      events.zipWithIndex.foldLeft(connection.createStatement(insertEventBatchSql)) {
+        case (stmt, (write, idx)) =>
+          if (idx != 0) {
+            stmt.add()
+          }
+          bind(stmt, write)
+      })
+
+    if (log.isDebugEnabled())
+      result.foreach { _ =>
+        log.debug("Wrote batch of [{}] events", events.size)
+      }
+
+    result.map(_ => ())(ExecutionContext.parasitic)
+  }
+
+  /**
+   * Prototype `UNNEST`-based variant of [[writeEventsInBatch]]: inserts the whole coalesced batch with a single
+   * multi-row statement (see [[insertEventBatchUnnestSql]]) instead of an R2DBC `add()` batch, trading one execution
+   * per row for a single execution with column-oriented array parameters. Selected by [[StreamBatchedWriteJournal]]
+   * when `batch.use-unnest = on`; only valid for the postgres/yugabyte dialects with `bytea` payloads.
+   *
+   * Runs in a transaction (via `updateInBatch`) so the whole batch still rolls back atomically, preserving the
+   * bisection retry semantics of the [[StreamBatchedWriteJournal]].
+   */
+  def writeEventsInBatchUnnest(events: Seq[SerializedJournalRow]): Future[Unit] = {
+    require(events.nonEmpty)
+    val n = events.size
+
+    // column-oriented arrays, one element per row (boxed so nullable columns can carry nulls)
+    val slices = new Array[java.lang.Integer](n)
+    val entityTypes = new Array[String](n)
+    val persistenceIds = new Array[String](n)
+    val seqNrs = new Array[java.lang.Long](n)
+    val writers = new Array[String](n)
+    val adapterManifests = new Array[String](n)
+    val eventSerIds = new Array[java.lang.Integer](n)
+    val eventSerManifests = new Array[String](n)
+    val eventPayloadsHex = new Array[String](n)
+    val tagsJson = new Array[String](n)
+    val metaSerIds = new Array[java.lang.Integer](n)
+    val metaSerManifests = new Array[String](n)
+    val metaPayloadsHex = new Array[String](n)
+    val dbTimestamps = new Array[String](n)
+
+    var i = 0
+    events.foreach { write =>
+      slices(i) = Int.box(write.slice)
+      entityTypes(i) = write.entityType
+      persistenceIds(i) = write.persistenceId
+      seqNrs(i) = Long.box(write.seqNr)
+      writers(i) = write.writerUuid
+      adapterManifests(i) = "" // FIXME event adapter
+      eventSerIds(i) = Int.box(write.serId)
+      eventSerManifests(i) = write.serManifest
+      eventPayloadsHex(i) = JournalDao.toHex(write.payload.get)
+      // empty tags are stored as SQL NULL, matching the add()-based insert
+      tagsJson(i) = if (write.tags.isEmpty) null else JournalDao.tagsToJsonArray(write.tags)
+      write.metadata match {
+        case Some(m) =>
+          metaSerIds(i) = Int.box(m.serId)
+          metaSerManifests(i) = m.serManifest
+          metaPayloadsHex(i) = JournalDao.toHex(m.payload)
+        case None =>
+          metaSerIds(i) = null
+          metaSerManifests(i) = null
+          metaPayloadsHex(i) = null
+      }
+      dbTimestamps(i) = write.dbTimestamp.toString
+      i += 1
+    }
+
+    val result = r2dbcExecutor.updateInBatch(s"batch insert via unnest [$n] events")(connection =>
+      connection
+        .createStatement(insertEventBatchUnnestSql)
+        .bind(0, slices)
+        .bind(1, entityTypes)
+        .bind(2, persistenceIds)
+        .bind(3, seqNrs)
+        .bind(4, writers)
+        .bind(5, adapterManifests)
+        .bind(6, eventSerIds)
+        .bind(7, eventSerManifests)
+        .bind(8, eventPayloadsHex)
+        .bind(9, tagsJson)
+        .bind(10, metaSerIds)
+        .bind(11, metaSerManifests)
+        .bind(12, metaPayloadsHex)
+        .bind(13, dbTimestamps))
+
+    if (log.isDebugEnabled())
+      result.foreach { _ =>
+        log.debug("Wrote batch of [{}] events via unnest", n)
+      }
+
+    result.map(_ => ())(ExecutionContext.parasitic)
   }
 
   def deleteMessagesTo(persistenceId: String, toSequenceNr: Long): Future[Unit] = {

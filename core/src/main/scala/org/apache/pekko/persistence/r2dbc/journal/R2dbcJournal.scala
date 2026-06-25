@@ -31,16 +31,12 @@ import pekko.persistence.AtomicWrite
 import pekko.persistence.Persistence
 import pekko.persistence.PersistentRepr
 import pekko.persistence.journal.AsyncWriteJournal
-import pekko.persistence.journal.Tagged
 import pekko.persistence.r2dbc.JournalSettings
 import pekko.persistence.r2dbc.internal.InstantFactory
 import pekko.persistence.r2dbc.internal.PubSub
-import pekko.persistence.r2dbc.journal.JournalDao.SerializedEventMetadata
 import pekko.persistence.r2dbc.journal.JournalDao.SerializedJournalRow
-import pekko.persistence.typed.PersistenceId
 import pekko.serialization.Serialization
 import pekko.serialization.SerializationExtension
-import pekko.serialization.Serializers
 import pekko.stream.scaladsl.Sink
 
 /**
@@ -107,49 +103,7 @@ private[r2dbc] final class R2dbcJournal(config: Config, cfgPath: String) extends
   override def asyncWriteMessages(messages: immutable.Seq[AtomicWrite]): Future[immutable.Seq[Try[Unit]]] = {
     def atomicWrite(atomicWrite: AtomicWrite): Future[Instant] = {
       val timestamp = if (journalSettings.useAppTimestamp) InstantFactory.now() else JournalDao.EmptyDbTimestamp
-      val serialized: Try[Seq[SerializedJournalRow]] = Try {
-        atomicWrite.payload.map { pr =>
-          val (event, tags) = pr.payload match {
-            case Tagged(payload, tags) =>
-              (payload.asInstanceOf[AnyRef], tags)
-            case other =>
-              (other.asInstanceOf[AnyRef], Set.empty[String])
-          }
-
-          val entityType = PersistenceId.extractEntityType(pr.persistenceId)
-          val slice = persistenceExt.sliceForPersistenceId(pr.persistenceId)
-
-          val serialized = serialization.serialize(event).get
-          val serializer = serialization.findSerializerFor(event)
-          val manifest = Serializers.manifestFor(serializer, event)
-          val id: Int = serializer.identifier
-
-          val metadata = pr.metadata.map { meta =>
-            val m = meta.asInstanceOf[AnyRef]
-            val serializedMeta = serialization.serialize(m).get
-            val metaSerializer = serialization.findSerializerFor(m)
-            val metaManifest = Serializers.manifestFor(metaSerializer, m)
-            val id: Int = metaSerializer.identifier
-            SerializedEventMetadata(id, metaManifest, serializedMeta)
-          }
-
-          SerializedJournalRow(
-            slice,
-            entityType,
-            pr.persistenceId,
-            pr.sequenceNr,
-            timestamp,
-            JournalDao.EmptyDbTimestamp,
-            Some(serialized),
-            id,
-            manifest,
-            pr.writerUuid,
-            tags,
-            metadata)
-        }
-      }
-
-      serialized match {
+      JournalSerialization.serialize(atomicWrite, timestamp, serialization, persistenceExt) match {
         case Success(writes) =>
           journalDao.writeEvents(writes)
         case Failure(exc) =>
