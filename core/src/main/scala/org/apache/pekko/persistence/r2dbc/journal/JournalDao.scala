@@ -143,6 +143,16 @@ private[r2dbc] class JournalDao(val settings: JournalSettings, connectionFactory
     (insertEventWithParameterTimestampSql, insertEventWithTransactionTimestampSql)
   }
 
+  /**
+   * Insert statement used by [[writeEventsInBatch]] to write rows for possibly different persistenceIds in one `add()`
+   * batch. The `db_timestamp` is always supplied as a parameter (application timestamp) and there is no per-row
+   * timestamp subselect, so there is nothing to return.
+   */
+  protected val insertEventBatchSql: String = sql"""
+    INSERT INTO $journalTable
+    (slice, entity_type, persistence_id, seq_nr, writer, adapter_manifest, event_ser_id, event_ser_manifest, event_payload, tags, meta_ser_id, meta_ser_manifest, meta_payload, db_timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
   private val deleteEventsSql = sql"""
     DELETE FROM $journalTable
     WHERE persistence_id = ? AND seq_nr <= ?"""
@@ -259,6 +269,70 @@ private[r2dbc] class JournalDao(val settings: JournalSettings, connectionFactory
         result.map(_ => events.head.dbTimestamp)(ExecutionContexts.parasitic)
       }
     }
+  }
+
+  /**
+   * Write events that may belong to *different* persistenceIds in a single statement (one `add()` batch in one
+   * transaction). Used by [[StreamBatchedWriteJournal]] to coalesce concurrent writes from many entities into a single
+   * database round-trip.
+   *
+   * In contrast to [[writeEvents]] this requires application timestamps (`use-app-timestamp = on`) and monotonically
+   * increasing timestamps (`db-timestamp-monotonic-increasing = on`) so that each row carries its own `db_timestamp`
+   * and no per-persistenceId timestamp subselect is needed. Those requirements are enforced when the
+   * [[StreamBatchedWriteJournal]] starts. No timestamp is returned because the rows can belong to different
+   * persistenceIds.
+   */
+  def writeEventsInBatch(events: Seq[SerializedJournalRow]): Future[Unit] = {
+    require(events.nonEmpty)
+
+    def bind(stmt: Statement, write: SerializedJournalRow): Statement = {
+      stmt
+        .bind(0, write.slice)
+        .bind(1, write.entityType)
+        .bind(2, write.persistenceId)
+        .bind(3, write.seqNr)
+        .bind(4, write.writerUuid)
+        .bind(5, "") // FIXME event adapter
+        .bind(6, write.serId)
+        .bind(7, write.serManifest)
+        .bind(8, write.payload.get)
+
+      if (write.tags.isEmpty)
+        stmt.bindNull(9, classOf[Array[String]])
+      else
+        stmt.bind(9, write.tags.toArray)
+
+      write.metadata match {
+        case Some(m) =>
+          stmt
+            .bind(10, m.serId)
+            .bind(11, m.serManifest)
+            .bind(12, m.payload)
+        case None =>
+          stmt
+            .bindNull(10, classOf[Integer])
+            .bindNull(11, classOf[String])
+            .bindNull(12, classOf[Array[Byte]])
+      }
+
+      stmt.bind(13, write.dbTimestamp)
+    }
+
+    val result = r2dbcExecutor.updateInBatch(s"batch insert [${events.size}] events")(connection =>
+      events.zipWithIndex.foldLeft(connection.createStatement(insertEventBatchSql)) {
+        case (stmt, (write, idx)) =>
+          if (idx != 0) {
+            stmt.add()
+          }
+          bind(stmt, write)
+      })
+
+    if (log.isDebugEnabled())
+      result.foreach { _ =>
+        log.debug("Wrote batch of [{}] events", events.size)
+      }
+
+    result.map(_ => ())(ExecutionContexts.parasitic)
   }
 
   def deleteMessagesTo(persistenceId: String, toSequenceNr: Long): Future[Unit] = {
