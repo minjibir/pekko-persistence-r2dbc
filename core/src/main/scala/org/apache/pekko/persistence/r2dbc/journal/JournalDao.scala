@@ -285,54 +285,82 @@ private[r2dbc] class JournalDao(val settings: JournalSettings, connectionFactory
   def writeEventsInBatch(events: Seq[SerializedJournalRow]): Future[Unit] = {
     require(events.nonEmpty)
 
-    def bind(stmt: Statement, write: SerializedJournalRow): Statement = {
-      stmt
-        .bind(0, write.slice)
-        .bind(1, write.entityType)
-        .bind(2, write.persistenceId)
-        .bind(3, write.seqNr)
-        .bind(4, write.writerUuid)
-        .bind(5, "") // FIXME event adapter
-        .bind(6, write.serId)
-        .bind(7, write.serManifest)
-        .bind(8, write.payload.get)
+    val MAX_CHUNK_SIZE = 4000
+    val chunks = events.grouped(MAX_CHUNK_SIZE).toList
 
-      if (write.tags.isEmpty)
-        stmt.bindNull(9, classOf[Array[String]])
-      else
-        stmt.bind(9, write.tags.toArray)
+    // 1. Safely split the existing single-row SQL provided by the Dialect
+    val sqlParts = insertEventBatchSql.split("(?i)\\sVALUES\\s")
+    val baseSql = sqlParts.head.trim
+    val singleRowValues = sqlParts.last.trim // e.g., "($1, ... $14)" or "(?, ... ?)"
 
-      write.metadata match {
-        case Some(m) =>
-          stmt
-            .bind(10, m.serId)
-            .bind(11, m.serManifest)
-            .bind(12, m.payload)
-        case None =>
-          stmt
-            .bindNull(10, classOf[Integer])
-            .bindNull(11, classOf[String])
-            .bindNull(12, classOf[Array[Byte]])
+    // 2. Auto-detect if the dialect uses indexed markers (Postgres/Yugabyte) or generic (MySQL)
+    val usesIndexedMarkers = singleRowValues.contains("$")
+
+    val chunkFutures = chunks.map { chunk =>
+      // 3. Generate the correct placeholder string for the dialect
+      val placeholders = if (usesIndexedMarkers) {
+        // Postgres / Yugabyte: ($1, ..., $14), ($15, ..., $28)
+        chunk.zipWithIndex.map { case (_, i) =>
+          val offset = i * 14
+          s"($$${offset + 1}, $$${offset + 2}, $$${offset + 3}, $$${offset + 4}, $$${offset + 5}, $$${offset + 6}, $$${offset + 7}, $$${offset + 8}, $$${offset + 9}, $$${offset + 10}, $$${offset + 11}, $$${offset + 12}, $$${offset + 13}, $$${offset + 14})"
+        }.mkString(", ")
+      } else {
+        // MySQL: (?, ..., ?), (?, ..., ?)
+        chunk.map { _ =>
+          "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        }.mkString(", ")
       }
 
-      stmt.bind(13, write.dbTimestamp)
+      val multiRowSql = s"$baseSql VALUES $placeholders"
+
+      val result = r2dbcExecutor.updateInBatch(s"multi-row insert [${chunk.size}] events") { connection =>
+        val stmt = connection.createStatement(multiRowSql)
+
+        // 4. The binding logic is 0-indexed and exactly the same for ALL databases!
+        chunk.zipWithIndex.foreach { case (write, idx) =>
+          val offset = idx * 14
+
+          stmt.bind(offset + 0, write.slice)
+          stmt.bind(offset + 1, write.entityType)
+          stmt.bind(offset + 2, write.persistenceId)
+          stmt.bind(offset + 3, write.seqNr)
+          stmt.bind(offset + 4, write.writerUuid)
+          stmt.bind(offset + 5, "") // FIXME event adapter
+          stmt.bind(offset + 6, write.serId)
+          stmt.bind(offset + 7, write.serManifest)
+          stmt.bind(offset + 8, write.payload.get)
+
+          if (write.tags.isEmpty)
+            stmt.bindNull(offset + 9, classOf[Array[String]])
+          else
+            stmt.bind(offset + 9, write.tags.toArray)
+
+          write.metadata match {
+            case Some(m) =>
+              stmt.bind(offset + 10, m.serId)
+              stmt.bind(offset + 11, m.serManifest)
+              stmt.bind(offset + 12, m.payload)
+            case None =>
+              stmt.bindNull(offset + 10, classOf[Integer])
+              stmt.bindNull(offset + 11, classOf[String])
+              stmt.bindNull(offset + 12, classOf[Array[Byte]])
+          }
+
+          stmt.bind(offset + 13, write.dbTimestamp)
+        }
+
+        stmt
+      }
+
+      if (log.isDebugEnabled())
+        result.foreach { _ =>
+          log.debug("Wrote chunk of [{}] events using multi-row insert", chunk.size)
+        }(ExecutionContexts.parasitic)
+
+      result
     }
 
-    val result = r2dbcExecutor.updateInBatch(s"batch insert [${events.size}] events")(connection =>
-      events.zipWithIndex.foldLeft(connection.createStatement(insertEventBatchSql)) {
-        case (stmt, (write, idx)) =>
-          if (idx != 0) {
-            stmt.add()
-          }
-          bind(stmt, write)
-      })
-
-    if (log.isDebugEnabled())
-      result.foreach { _ =>
-        log.debug("Wrote batch of [{}] events", events.size)
-      }
-
-    result.map(_ => ())(ExecutionContexts.parasitic)
+    Future.sequence(chunkFutures).map(_ => ())(ExecutionContexts.parasitic)
   }
 
   def deleteMessagesTo(persistenceId: String, toSequenceNr: Long): Future[Unit] = {
