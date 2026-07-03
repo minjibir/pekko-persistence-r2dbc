@@ -1,0 +1,49 @@
+Run date: 2026-06-26
+
+max-requests sweep at window=2ms (1k/2k/3k actors). Question: does raising batch.max-requests help throughput?
+Answer: no - on loopback it HURTS, because large batches under-utilise batch.parallelism.
+
+Environment
+- Database:        PostgreSQL 18.4 (docker image postgres:latest), localhost loopback (docker-compose-postgres.yml)
+- JDK:             Eclipse Temurin 17.0.0+35
+- Scala:           2.13.18
+- Host:            Linux x86_64, 12 CPUs
+- Forked test JVM: -Xmx3g
+- Connection pool: connection-factory.max-size = 20 (default)
+- Batched config:  batch.window = 2 ms, batch.parallelism = 8 (default); batch.max-requests swept = 100,500,1000,5000
+
+Parameters
+- eventsCount = 20, iterations = 3 (best), warmup = 2
+- actorCounts = 1000,2000,3000
+
+Command (default once; batched once per max-requests value)
+  sbt -java-home "$JAVA_HOME" -Dpekko.bench.actorCounts=1000,2000,3000 -Dpekko.bench.iterations=3 -Dpekko.bench.warmup=2 \
+    -batch 'set Test/javaOptions += "-Xmx3g"' "core/Test/testOnly ...BenchmarkDefaultManyActorsSpec"
+  sbt ... -Dpekko.bench.window=2ms -Dpekko.bench.maxRequests=$MR ... "core/Test/testOnly ...BenchmarkBatchedManyActorsSpec"
+
+Raw output (best of 3, ev/s)
+  BENCH[default]                       actors=1000  16950   actors=2000  17454   actors=3000  16368
+  BENCH[batched] window=2ms maxReq=100 actors=1000  22499   actors=2000  25938   actors=3000  26357
+  BENCH[batched] window=2ms maxReq=500 actors=1000  12445   actors=2000  18879   actors=3000  22902
+  BENCH[batched] window=2ms maxReq=1000 actors=1000  7123   actors=2000  12609   actors=3000  16818
+  BENCH[batched] window=2ms maxReq=5000 actors=1000  6917   actors=2000   8912   actors=3000   8594
+
+Summary (ev/s)
+  actors  default  mr=100  mr=500  mr=1000  mr=5000
+  1000    16950    22499   12445   7123     6917
+  2000    17454    25938   18879   12609    8912
+  3000    16368    26357   22902   16818    8594
+
+Conclusion
+- max-requests=100 (the current default) is the best of the values tested; throughput falls monotonically as
+  max-requests grows. window=2ms keeps full throughput (same as the earlier 3/5/10 ms runs at mr=100).
+- Why: groupedWithin emits a batch when EITHER max-requests is reached OR the window elapses. With small max-requests a
+  round of N concurrent writes becomes ceil(N/max-requests) batches that fan out across batch.parallelism (=8) and the
+  connection pool. With large max-requests the whole round collapses into ONE big batch handled by ONE mapAsync slot -
+  the other slots idle and the single large transaction is slower than many small pipelined ones. Effective parallelism
+  ~ min(ceil(N/max-requests), parallelism), so big max-requests starves parallelism.
+- Practical rule (loopback): keep max-requests roughly <= actorCount / parallelism so all slots stay busy; 100 is near
+  optimal for 1k-3k actors at parallelism=8. The real throughput lever is parallelism (x pool size), NOT max-requests.
+- Caveat: loopback has ~zero network RTT, which is why many small batches win (round-trips are almost free). On a
+  NETWORKED database, fewer/larger batches reduce round-trips and the optimum max-requests will be higher - worth
+  re-measuring there. Even so, very large values (5000+) also inflate transaction size and the failure-retry cost.

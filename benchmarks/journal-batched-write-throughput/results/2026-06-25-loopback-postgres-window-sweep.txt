@@ -1,0 +1,71 @@
+Run date: 2026-06-25
+
+High-concurrency window sweep (1k/2k/3k actors x batch.window 3/5/10 ms).
+
+Environment
+- Database:        PostgreSQL 18.4 (docker image postgres:latest), localhost loopback (docker-compose-postgres.yml)
+- JDK:             Eclipse Temurin 17.0.0+35
+- Scala:           2.13.18
+- Host:            Linux x86_64, 12 CPUs
+- Forked test JVM: -Xmx3g (set Test/javaOptions += "-Xmx3g") because of the high actor counts
+- Connection pool: pekko.persistence.r2dbc.connection-factory.max-size = 20 (default), for BOTH journals
+- Batched config:  batch.max-requests = 100, batch.parallelism = 8 (defaults); batch.window swept = 3 ms, 5 ms, 10 ms
+
+Parameters
+- eventsCount = 20, iterations = 3 (best reported), warmup = 2
+- actorCounts = 1000,2000,3000
+
+Command (run once per window W in 3ms,5ms,10ms)
+  export JAVA_HOME=$(cs java-home --jvm temurin:1.17.0.0)
+  sbt -java-home "$JAVA_HOME" \
+    -Dpekko.bench.actorCounts=1000,2000,3000 \
+    -Dpekko.bench.eventsCount=20 \
+    -Dpekko.bench.iterations=3 \
+    -Dpekko.bench.warmup=2 \
+    -Dpekko.bench.window=$W \
+    -batch 'set Test/javaOptions += "-Xmx3g"' \
+    "core/Test/testOnly org.apache.pekko.persistence.r2dbc.journal.BenchmarkDefaultManyActorsSpec org.apache.pekko.persistence.r2dbc.journal.BenchmarkBatchedManyActorsSpec"
+
+Raw output (best of 3; default is window-independent, measured in each session)
+  ===== WINDOW=3ms =====
+  BENCH[default] actors=1000 events/actor=20   best=  1272.2 ms       15721 ev/s
+  BENCH[default] actors=2000 events/actor=20   best=  2490.6 ms       16060 ev/s
+  BENCH[default] actors=3000 events/actor=20   best=  4121.6 ms       14557 ev/s
+  BENCH[batched] window=3ms  actors=1000 events/actor=20   best=   885.4 ms       22588 ev/s
+  BENCH[batched] window=3ms  actors=2000 events/actor=20   best=  1617.6 ms       24728 ev/s
+  BENCH[batched] window=3ms  actors=3000 events/actor=20   best=  2499.7 ms       24003 ev/s
+  ===== WINDOW=5ms =====
+  BENCH[default] actors=1000 events/actor=20   best=  1592.3 ms       12560 ev/s
+  BENCH[default] actors=2000 events/actor=20   best=  3370.6 ms       11867 ev/s
+  BENCH[default] actors=3000 events/actor=20   best=  3841.5 ms       15619 ev/s
+  BENCH[batched] window=5ms  actors=1000 events/actor=20   best=   881.9 ms       22679 ev/s
+  BENCH[batched] window=5ms  actors=2000 events/actor=20   best=  1537.5 ms       26016 ev/s
+  BENCH[batched] window=5ms  actors=3000 events/actor=20   best=  2318.8 ms       25875 ev/s
+  ===== WINDOW=10ms =====
+  BENCH[default] actors=1000 events/actor=20   best=  1558.1 ms       12836 ev/s
+  BENCH[default] actors=2000 events/actor=20   best=  2919.9 ms       13699 ev/s
+  BENCH[default] actors=3000 events/actor=20   best=  4139.7 ms       14494 ev/s
+  BENCH[batched] window=10ms actors=1000 events/actor=20   best=   903.6 ms       22134 ev/s
+  BENCH[batched] window=10ms actors=2000 events/actor=20   best=  1598.7 ms       25020 ev/s
+  BENCH[batched] window=10ms actors=3000 events/actor=20   best=  2444.2 ms       24548 ev/s
+
+Speedup (batched / default, same session)
+  window  actors  default   batched   speedup
+  3ms     1000    15721     22588     1.44x
+  3ms     2000    16060     24728     1.54x
+  3ms     3000    14557     24003     1.65x
+  5ms     1000    12560     22679     1.81x
+  5ms     2000    11867     26016     2.19x
+  5ms     3000    15619     25875     1.66x
+  10ms    1000    12836     22134     1.72x
+  10ms    2000    13699     25020     1.83x
+  10ms    3000    14494     24548     1.69x
+
+Notes
+- At 1k-3k concurrent actors the batched journal is consistently ~1.4-2.2x faster than the default, even on loopback.
+- Window length (3/5/10 ms) has only a minor effect on throughput at this concurrency: each round already fills batches
+  regardless of window (max-requests=100 cap), so the window mostly affects latency, not peak throughput here. 5 ms was
+  marginally best but within run-to-run noise.
+- Batched throughput plateaus around 24k-26k ev/s. With actorCount >> max-requests this is bounded by
+  batch.max-requests (100) and batch.parallelism (8); raising those is the next tuning lever (not varied here).
+- The default journal numbers are window-independent; their spread (~12k-16k) reflects run-to-run variance.

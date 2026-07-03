@@ -1,0 +1,94 @@
+Journal write throughput and stability for very large events: default vs add() vs UNNEST
+========================================================================================
+
+Extends the payload-size study beyond 128 KB (including non-power-of-2 sizes) to find where
+each strategy breaks down. The headline finding is a *stability* one, not just throughput:
+the UNNEST path runs out of memory and fails for large events, while default and add()
+survive.
+
+Environment
+-----------
+PostgreSQL 18.4 over loopback (docker, port 5433), JDK 17.0.19 (temurin), Scala 2.13,
+12-CPU host (62 GB RAM). Forked test JVM at -Xmx6g (default MaxDirectMemorySize = 256 MB).
+Pool max-size=20, batched defaults (batch.window=10ms, batch.max-requests=100,
+batch.parallelism=8). actorCount=500 (size-flush regime), eventsCount=5, warmup=1, best of
+2. event_journal TRUNCATEd between sizes. Payload is a fixed-size byte array per event
+(pekko.bench.payloadSize; PayloadBenchActor). All three journals in the same session.
+
+NOTE: eventsCount=5 / iterations=2 makes the absolute default-vs-add() numbers noisy at
+these sizes (I/O-bound, high variance - see the 300 KB default outlier). The robust,
+repeatable finding is the UNNEST OutOfMemoryError at >= 256 KB.
+
+Raw BENCH output (+ failures)
+-----------------------------
+# 128 KB
+BENCH[default] payload=131072B actors=500  events/actor=5    best=  1371.7 ms        1823 ev/s
+BENCH[add    ] payload=131072B actors=500  events/actor=5    best=  1450.8 ms        1723 ev/s
+BENCH[unnest ] payload=131072B actors=500  events/actor=5    best=  2868.7 ms         871 ev/s
+# 150 KB
+BENCH[default] payload=153600B actors=500  events/actor=5    best=  1633.7 ms        1530 ev/s
+BENCH[add    ] payload=153600B actors=500  events/actor=5    best=  1715.7 ms        1457 ev/s
+BENCH[unnest ] payload=153600B actors=500  events/actor=5    best=  4063.5 ms         615 ev/s   (completed, then "queue already completed" on teardown)
+# 256 KB
+BENCH[default] payload=262144B actors=500  events/actor=5    best=  2465.2 ms        1014 ev/s
+BENCH[add    ] payload=262144B actors=500  events/actor=5    best=  3042.6 ms         822 ev/s
+unnest: FAILED - java.lang.OutOfMemoryError: Cannot reserve 37748736 bytes of direct buffer memory (allocated: 256451228, limit: 268435456)
+# 300 KB
+BENCH[default] payload=307200B actors=500  events/actor=5    best=  4869.1 ms         513 ev/s   (noisy/low - variance)
+BENCH[add    ] payload=307200B actors=500  events/actor=5    best=  3340.0 ms         748 ev/s
+unnest: FAILED - java.lang.OutOfMemoryError: Cannot reserve 46137344 bytes of direct buffer memory (allocated: 235479708, limit: 268435456)
+# 500 KB
+BENCH[default] payload=512000B actors=500  events/actor=5    best=  4780.1 ms         523 ev/s
+BENCH[add    ] payload=512000B actors=500  events/actor=5    best=  5988.8 ms         417 ev/s
+unnest: FAILED - java.lang.OutOfMemoryError: Cannot reserve 37748736 bytes of direct buffer memory (allocated: 252256924, limit: 268435456)
+# 512 KB
+BENCH[default] payload=524288B actors=500  events/actor=5    best=  4713.5 ms         530 ev/s
+BENCH[add    ] payload=524288B actors=500  events/actor=5    best=  9834.3 ms         254 ev/s
+unnest: FAILED - java.lang.OutOfMemoryError: Java heap space
+
+Summary (ev/s, actorCount=500; "OOM" = failed)
+----------------------------------------------
+payload | default | add()  | UNNEST
+128 KB  |   1,823 | 1,723  |   871
+150 KB  |   1,530 | 1,457  |   615
+256 KB  |   1,014 |   822  |   OOM
+300 KB  |     513*|   748  |   OOM
+500 KB  |     523 |   417  |   OOM
+512 KB  |     530 |   254  |   OOM
+(* 300 KB default is a low outlier - run-to-run variance at low sample count)
+
+Findings
+--------
+1. UNNEST is a hard liability for large events - it FAILS, not just slows. At >= 256 KB it
+   throws OutOfMemoryError (direct buffer memory, then Java heap at 512 KB). Cause: the
+   UNNEST insert hex-encodes each payload (2x) and materializes the whole coalesced batch
+   as one statement's array parameters in off-heap Netty buffers; a batch of up to
+   batch.max-requests rows * 2 * payloadSize easily exceeds the 256 MB direct-memory limit.
+   Raising -Xmx does not help (direct memory is off-heap); at 512 KB it also exhausts heap.
+2. default and add() survive all sizes: default writes single rows; add() streams per-row
+   bind parameters; neither hex-encodes. So neither materializes a giant buffer.
+3. Even where UNNEST completes (128-150 KB) it is ~2x slower than default/add().
+4. default vs add() for large events: default is generally >= add() and add() collapses at
+   the top (512 KB: add() 254 vs default 530). Batching very large payloads into one
+   transaction inflates transaction size/latency more than it saves, so *not batching* is
+   best. (Absolute numbers are noisy here; the ordering default >= add() >> UNNEST-or-OOM is
+   the takeaway.)
+
+Implications
+------------
+- Do NOT enable batch.use-unnest for workloads with large events (>= a couple hundred KB is
+  an outright OOM risk with default batch sizes; the memory needed scales with
+  batch.max-requests * 2 * payloadSize of off-heap buffer). This is a correctness/stability
+  concern, not only performance.
+- The current codec guard (bytea vs json) is not sufficient protection. A future auto-select
+  heuristic (or a hard payload-size cap) should restrict UNNEST to small events and fall
+  back to add() otherwise - now motivated by stability, not just throughput.
+- A bytea[] binding (if the driver gains support) would remove the hex 2x and reduce, though
+  not eliminate, the large-batch memory pressure.
+
+"When to use what" across the full size range (high concurrency, loopback)
+--------------------------------------------------------------------------
+  <= ~8 KB          : UNNEST   (fastest)
+  ~8 KB .. ~150 KB  : add()    (UNNEST fading/at 2x slower; still completes)
+  >= ~256 KB        : default  (no batching; UNNEST OOMs, add() drops below default)
+

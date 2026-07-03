@@ -1,0 +1,102 @@
+Journal write throughput vs event payload size: default vs add() vs UNNEST
+=========================================================================
+
+Three-way comparison (no batching / add()-based batch / UNNEST-based batch) at fixed high
+concurrency, sweeping the event payload size. This answers "when should I not batch, use
+the add() batch, or use the UNNEST batch?" for a given event size.
+
+Background: because r2dbc-postgresql cannot bind bytea[], the UNNEST path passes each event
+payload as a lowercase-hex text[] and decodes it in SQL (decode(?, 'hex')). Hex doubles the
+payload bytes on the wire, so the UNNEST advantage shrinks and eventually inverts as payloads
+grow. The default journal and the add() batch store bytea directly (no hex).
+
+Environment
+-----------
+PostgreSQL 18.4 over loopback (docker, port 5433), JDK 17.0.19 (temurin), Scala 2.13,
+12-CPU host, forked test JVM at -Xmx3g. Pool max-size=20, batched defaults
+(batch.window=10ms, batch.max-requests=100, batch.parallelism=8). Fixed actorCount=500
+(size-flush regime), eventsCount=20, warmup=1, best of 3. Payload is a fixed-size byte
+array persisted per event (pekko.bench.payloadSize; PayloadBenchActor in the harness). All
+three journals measured in the same session for direct comparability.
+
+Raw BENCH output
+----------------
+BENCH[default] payload=256   B actors=500  events/actor=20   best=  1126.1 ms        8880 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=256   B actors=500  events/actor=20   best=   432.5 ms       23120 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=256   B actors=500  events/actor=20   best=   190.1 ms       52597 ev/s
+BENCH[default] payload=1024  B actors=500  events/actor=20   best=   750.7 ms       13320 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=1024  B actors=500  events/actor=20   best=   521.4 ms       19178 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=1024  B actors=500  events/actor=20   best=   219.6 ms       45545 ev/s
+BENCH[default] payload=4096  B actors=500  events/actor=20   best=   786.8 ms       12710 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=4096  B actors=500  events/actor=20   best=   598.9 ms       16698 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=4096  B actors=500  events/actor=20   best=   436.6 ms       22904 ev/s
+BENCH[default] payload=8192  B actors=500  events/actor=20   best=  1002.2 ms        9978 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=8192  B actors=500  events/actor=20   best=   899.7 ms       11115 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=8192  B actors=500  events/actor=20   best=   844.0 ms       11849 ev/s
+BENCH[default] payload=16384 B actors=500  events/actor=20   best=  1502.6 ms        6655 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=16384 B actors=500  events/actor=20   best=  1200.7 ms        8329 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=16384 B actors=500  events/actor=20   best=  1460.5 ms        6847 ev/s
+BENCH[default] payload=131072B actors=500  events/actor=20   best=  4265.2 ms        2345 ev/s
+BENCH[add    ] window=10ms maxReq=100   payload=131072B actors=500  events/actor=20   best=  5640.5 ms        1773 ev/s
+BENCH[unnest ] window=10ms maxReq=100   payload=131072B actors=500  events/actor=20   best= 11807.7 ms         847 ev/s
+
+Summary (ev/s, actorCount=500) - higher is better
+--------------------------------------------------
+payload | default | add()  | UNNEST | winner  | UNNEST/default | UNNEST/add()
+  256 B |   8,880 | 23,120 | 52,597 | UNNEST  | 5.92x          | 2.28x
+  1 KB  |  13,320 | 19,178 | 45,545 | UNNEST  | 3.42x          | 2.37x
+  4 KB  |  12,710 | 16,698 | 22,904 | UNNEST  | 1.80x          | 1.37x
+  8 KB  |   9,978 | 11,115 | 11,849 | UNNEST  | 1.19x          | 1.07x
+ 16 KB  |   6,655 |  8,329 |  6,847 | add()   | 1.03x          | 0.82x
+128 KB  |   2,345 |  1,773 |    847 | default | 0.36x          | 0.48x
+
+When is UNNEST a liability - vs add() or vs default?
+----------------------------------------------------
+There are two distinct crossovers, so "greater than 8 KB" is a liability *against add()
+first*, and only against the default journal at much larger sizes:
+
+- vs add(): UNNEST wins up to ~8 KB, is even at ~8 KB, and is a liability above ~8 KB
+  (16 KB: 0.82x; 128 KB: 0.48x). add() has no hex overhead, so it beats UNNEST for larger
+  events.
+- vs default: UNNEST stays ahead of (or equal to) the default journal much longer - still
+  ~1.03x (a tie) at 16 KB. It only becomes a liability against the default for very large
+  events (128 KB: 0.36x).
+- Note the third crossover: even the add() batch drops below the default for very large
+  events (16 KB add() 8,329 > default 6,655, but 128 KB add() 1,773 < default 2,345). At
+  that size, per-round batching of huge payloads inflates transaction size/latency more
+  than it saves, so *not batching* wins.
+
+"When to use what" at high concurrency (>= batch.max-requests), loopback
+------------------------------------------------------------------------
+- payload <= ~8 KB : use UNNEST  (fastest; up to ~2.3x over add(), ~6x over default)
+- ~8 KB .. ~tens of KB : use add() (UNNEST's hex cost now exceeds its round-trip savings;
+                          add() still beats default)
+- very large (~100 KB+) : use the default journal (both batched paths regress below
+                          no-batch; UNNEST is worst)
+
+Caveats
+-------
+- These crossovers are loopback-specific. On a networked database, saving a round-trip per
+  row is worth more, so both crossovers (UNNEST-vs-add and add-vs-default) move to larger
+  payloads. Re-measure for your deployment.
+- Requires the size-flush regime (concurrent writers >= batch.max-requests); below it the
+  batched journal is window-bound and add() == UNNEST (see the actor-count results file).
+- A future bytea[] binding (if the driver gains support) or binary array encoding would
+  remove the hex overhead and push the UNNEST-vs-add crossover to larger payloads.
+
+Where the single-insert default overtakes batching (payload dimension)
+----------------------------------------------------------------------
+Fill-in at 32 KB and 64 KB (actorCount=500, eventsCount=10, warmup=1, best of 3) to pin the
+default-vs-batched crossover by event size:
+
+payload | default | add()  | unnest(adaptive) | winner
+ 16 KB  |   6,655 |  8,329 |            6,847 | batched (add)
+ 32 KB  |   4,572 |  4,328 |            4,942 | ~tie (crossover)
+ 64 KB  |   3,049 |  1,509 |            1,813 | default (single insert)
+128 KB  |   1,823 |  1,723 |         ~871/OOM | default
+
+So at high concurrency the single-row default journal overtakes the batched journal at
+~32 KB per event: batching wins below, they are about even at ~32 KB, and the single insert
+clearly wins from ~64 KB up (2x by 64 KB). (Above 8 KB the adaptive "unnest" spec has already
+fallen back to add(), so add() and unnest track each other here; differences are variance.)
+

@@ -1,0 +1,59 @@
+Adaptive batched journal (use-unnest = on): one run, best strategy per event size
+=================================================================================
+
+Demonstrates the adaptive UNNEST switch. With batch.use-unnest = on and the default
+batch.unnest-max-payload-size = 8 KiB, the batched journal chooses per batch: it uses the
+UNNEST insert for events within the cap and falls back to the add() insert for larger ones.
+The "unnest" spec below IS this adaptive journal (it does not override the cap), so a single
+`use-unnest = on` configuration tracks the fastest safe strategy as event size changes - and,
+crucially, no longer OOMs on large events (compare 2026-07-02-loopback-postgres-unnest-large-payload.txt,
+where the uncapped UNNEST failed at >= 256 KB).
+
+Environment
+-----------
+PostgreSQL 18.4 over loopback (docker, port 5433), JDK 17.0.19, Scala 2.13, 12-CPU host,
+forked test JVM -Xmx6g. actorCount=500, eventsCount=5, warmup=1, best of 3. event_journal
+TRUNCATEd between sizes. "unnest" spec = use-unnest on, unnest-max-payload-size = 8 KiB
+(default) => adaptive.
+
+Raw BENCH output
+----------------
+# 1 KB (<= cap): adaptive uses UNNEST
+BENCH[default] payload=1024  B actors=500  events/actor=5    best=   505.9 ms        4941 ev/s
+BENCH[add    ] payload=1024  B actors=500  events/actor=5    best=   351.7 ms        7109 ev/s
+BENCH[unnest ] payload=1024  B actors=500  events/actor=5    best=   111.0 ms       22515 ev/s
+# 16 KB (> cap): adaptive falls back to add()
+BENCH[default] payload=16384 B actors=500  events/actor=5    best=   534.3 ms        4679 ev/s
+BENCH[add    ] payload=16384 B actors=500  events/actor=5    best=   405.9 ms        6159 ev/s
+BENCH[unnest ] payload=16384 B actors=500  events/actor=5    best=   380.3 ms        6573 ev/s
+# 256 KB (> cap): adaptive falls back to add() - completes, previously OOM'd
+BENCH[default] payload=262144B actors=500  events/actor=5    best=  2031.2 ms        1231 ev/s
+BENCH[add    ] payload=262144B actors=500  events/actor=5    best=  2874.6 ms         870 ev/s
+BENCH[unnest ] payload=262144B actors=500  events/actor=5    best=  2368.9 ms        1055 ev/s
+
+Summary (ev/s, actorCount=500)
+------------------------------
+payload | default | add()  | unnest (adaptive) | adaptive did      | adaptive vs add()
+  1 KB  |   4,941 | 7,109  |            22,515 | UNNEST            | 3.17x (wins)
+ 16 KB  |   4,679 | 6,159  |             6,573 | add() fallback    | 1.07x (~= add)
+256 KB  |   1,231 |   870  |             1,055 | add() fallback    | 1.21x (~= add, NO OOM)
+
+Findings
+--------
+- One config (use-unnest = on) automatically picks the right insert per batch:
+    * 1 KB  -> UNNEST path: 22,515 ev/s, ~3.2x the add() batch and ~4.6x the default journal.
+    * 16 KB -> add() fallback: 6,573 ev/s, matching the add() spec (6,159) - the 8 KiB cap
+      routes >8 KB events off the UNNEST path.
+    * 256 KB -> add() fallback: 1,055 ev/s, matching the add() spec (870) and COMPLETING.
+      The uncapped UNNEST previously failed here with OutOfMemoryError; the cap prevents it.
+- So the adaptive journal is "fast where UNNEST wins, safe everywhere else" - it never does
+  worse than the add() batch and never OOMs, with no per-workload tuning.
+- For very large events the default journal (no batching) is still fastest (256 KB: 1,231 vs
+  1,055); the adaptive batched journal is safe but batching huge payloads remains suboptimal.
+  Reserve the batched journal for small/medium-event, high-concurrency workloads.
+
+Reproduce
+---------
+Adaptive (default cap):   run the three specs with -Dpekko.bench.payloadSize=<bytes>.
+Raw uncapped UNNEST:      add -Dpekko.bench.unnestMaxPayloadSize=1GiB (reproduces the OOM at >= 256 KB).
+

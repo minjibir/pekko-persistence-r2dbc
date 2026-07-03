@@ -1,0 +1,133 @@
+Journal batched-write throughput: UNNEST insert vs add()-based batch insert
+===========================================================================
+
+Compares the batched journal's two insert strategies (batch.use-unnest = off vs on)
+against the default journal baseline, as the number of concurrently-writing persistent
+actors increases.
+
+Environment
+-----------
+PostgreSQL 18.4 over loopback (docker, port 5433), JDK 17.0.19 (temurin), Scala 2.13,
+12-CPU host, forked test JVM at -Xmx3g. Connection pool max-size=20, batched defaults
+(batch.window=10ms, batch.max-requests=100, batch.parallelism=8). eventsCount=20,
+warmup=1, best of 3.
+
+Payloads are tiny (a single short string per event), so the UNNEST path's hex-encoding
+of the bytea payload column adds negligible bytes here; large payloads would narrow the
+gap and should be measured separately.
+
+Command
+-------
+# session 1 (default baseline + batched add()):
+sbt -Dpekko.persistence.r2dbc.connection-factory.port=5433 \
+    -Dpekko.bench.actorCounts=10,50,200,500,1000 -Dpekko.bench.eventsCount=20 \
+    -Dpekko.bench.iterations=3 -Dpekko.bench.warmup=1 -Dpekko.bench.useUnnest=false \
+    'set Test/javaOptions += "-Xmx3g"' \
+    "core/Test/testOnly ...BenchmarkDefaultManyActorsSpec ...BenchmarkBatchedManyActorsSpec"
+# session 2 (batched UNNEST):
+sbt ... -Dpekko.bench.useUnnest=true "core/Test/testOnly ...BenchmarkBatchedManyActorsSpec"
+
+Raw BENCH output
+----------------
+BENCH[default] actors=10   events/actor=20   best=    89.3 ms        2240 ev/s
+BENCH[default] actors=50   events/actor=20   best=   187.7 ms        5329 ev/s
+BENCH[default] actors=200  events/actor=20   best=   789.8 ms        5065 ev/s
+BENCH[default] actors=500  events/actor=20   best=  2028.9 ms        4929 ev/s
+BENCH[default] actors=1000 events/actor=20   best=  1037.3 ms       19280 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=10   events/actor=20   best=   588.2 ms         340 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=50   events/actor=20   best=   616.8 ms        1621 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=200  events/actor=20   best=   306.4 ms       13055 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=500  events/actor=20   best=   388.5 ms       25737 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=1000 events/actor=20   best=   582.1 ms       34358 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=10   events/actor=20   best=   584.0 ms         342 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=50   events/actor=20   best=   597.1 ms        1675 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=200  events/actor=20   best=   158.1 ms       25301 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=500  events/actor=20   best=   214.3 ms       46665 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=1000 events/actor=20   best=   374.3 ms       53433 ev/s
+
+Summary (ev/s)
+--------------
+actors | default | batched add() | batched UNNEST | UNNEST vs add()
+    10  |   2,240 |          340  |          342   | 1.01x
+    50  |   5,329 |        1,621  |        1,675   | 1.03x
+   200  |   5,065 |       13,055  |       25,301   | 1.94x
+   500  |   4,929 |       25,737  |       46,665   | 1.81x
+  1000  |  19,280 |       34,358  |       53,433   | 1.55x
+
+Observations
+------------
+- At >= 200 concurrent actors the UNNEST insert is ~1.55-1.94x faster than the add()
+  batch: a single execution with column-oriented array parameters beats one prepared-
+  statement execution per row once batches are large.
+- At low concurrency (10-50 actors) the two are within noise: batches are tiny (often a
+  single row) so the per-row-vs-array difference is dwarfed by the batch.window latency.
+- The default-journal numbers are the same-session loopback baseline (noisy; it ignores
+  the batch window). The meaningful comparison here is add() vs UNNEST.
+- Caveat: payloads are tiny here. The UNNEST path hex-encodes bytea payloads (doubling
+  those bytes on the wire), so re-measure with realistic payload sizes before drawing
+  conclusions for large-event workloads.
+
+100-actor focus (crossover zone), warmup=2, best of 5
+-----------------------------------------------------
+BENCH[default] actors=50   events/actor=20   best=   119.6 ms        8361 ev/s
+BENCH[default] actors=100  events/actor=20   best=   177.1 ms       11292 ev/s
+BENCH[default] actors=200  events/actor=20   best=   321.5 ms       12441 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=50   events/actor=20   best=   607.8 ms        1645 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=100  events/actor=20   best=   333.2 ms        6002 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=false actors=200  events/actor=20   best=   337.6 ms       11848 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=50   events/actor=20   best=   597.5 ms        1674 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=100  events/actor=20   best=   123.2 ms       16228 ev/s
+BENCH[batched] window=10ms maxReq=100   unnest=true  actors=200  events/actor=20   best=   116.1 ms       34457 ev/s
+
+actors | default | batched add() | batched UNNEST | UNNEST vs add() | UNNEST vs default | add() vs default
+    50  |   8,361 |        1,645  |        1,674   | 1.02x           | 0.20x             | 0.20x
+   100  |  11,292 |        6,002  |       16,228   | 2.70x           | 1.44x             | 0.53x
+   200  |  12,441 |       11,848  |       34,457   | 2.91x           | 2.77x             | 0.95x
+
+At 100 actors the UNNEST path shows its biggest relative win (~2.7x over add()) and,
+crucially, it is the point where the batched journal starts *beating the default journal*
+(1.44x) - whereas the add() path at 100 actors is still a net loss vs default (0.53x). In
+other words, UNNEST lowers the break-even concurrency: the batched journal becomes
+worthwhile at ~100 concurrent actors with UNNEST, versus ~200 with the add() batch. At 50
+actors neither batched path helps yet (batches too small); the win appears between 50 and
+100 actors.
+
+Crossover is governed by batch.max-requests, not an absolute actor count
+------------------------------------------------------------------------
+Filling in 60/70/80/90 actors (warmup=2, best of 5) showed add() and UNNEST are *equal*
+there (both ~2-3k ev/s) and both far below the default journal:
+
+actors | default | add() (mr=100) | UNNEST (mr=100) | UNNEST vs add()
+    60  |   7,668 |         2,055  |          2,006  | 1.02x
+    70  |  10,718 |         2,342  |          2,384  | 1.02x
+    80  |  13,529 |         2,636  |          2,688  | 1.02x
+    90  |  16,812 |         2,615  |          3,054  | 1.17x
+
+The sharp jump at 100 actors (add 6,002; UNNEST 16,228) coincides exactly with
+batch.max-requests=100. Explanation: below max-requests each round of N concurrent writes
+does not fill a batch, so groupedWithin flushes on the batch.window (10ms) timer - the run
+is *window-latency-bound* and the DB insert cost is irrelevant (add == UNNEST). At/above
+max-requests the batch flushes by *size*, the insert cost dominates, and UNNEST's single
+array-parameter execution wins.
+
+Confirmed by lowering max-requests to 50 so 60/90 actors flush by size:
+
+actors | add() (mr=50) | UNNEST (mr=50) | UNNEST vs add() | UNNEST vs default
+    60  |        4,065  |         7,784  | 1.91x           | 1.02x (matches default)
+    90  |        6,183  |        15,647  | 2.53x           | 0.93x (near default)
+
+Compared with mr=100 at the same actor counts (2,055/2,006 and 2,615/3,054), lowering
+max-requests into the size-flush regime both raises absolute throughput AND unlocks the
+~1.9-2.5x UNNEST advantage at 60-90 actors.
+
+Bottom line for tuning
+----------------------
+- The UNNEST benefit appears only in the size-flush regime (concurrent writers >=
+  batch.max-requests). There it is ~1.9-2.9x faster than add().
+- To get that benefit at lower concurrency, set batch.max-requests at or below your
+  expected concurrent-writer count so batches flush by size rather than on the window.
+- With that tuning, UNNEST makes the batched journal break even with the default journal
+  at ~60 concurrent actors (loopback), versus ~200 for the add() batch untuned.
+
+
+
