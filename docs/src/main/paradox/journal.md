@@ -31,6 +31,33 @@ The following can be overridden in your `application.conf` for the journal speci
 
 @@snip [reference.conf](/core/src/main/resources/reference.conf) {#journal-settings}
 
+## Batched Journal
+
+The batched journal plugin (`R2dbcBatchJournal`) coalesces concurrent write requests across multiple persistence IDs into shared multi-row database operations to increase throughput under high concurrency.
+
+### Batched Journal Configuration
+
+To enable the batched journal, update `application.conf`:
+
+```
+pekko.persistence.r2dbc {
+  # Batched journal requires application timestamps and monotonic database timestamps
+  use-app-timestamp = on
+  db-timestamp-monotonic-increasing = on
+
+  journal {
+    class = "org.apache.pekko.persistence.r2dbc.journal.R2dbcBatchJournal"
+    max-batch-size = 100
+    max-batch-time = 2ms
+  }
+}
+```
+
+The batched journal uses the following settings:
+
+- `max-batch-size`: The maximum number of writes to coalesce into a single database insert batch.
+- `max-batch-time`: The maximum time to buffer writes before flushing the batch to the database.
+
 ## Deletes
 
 The journal supports deletes through hard deletes, which means the journal entries are actually deleted from the database. 
