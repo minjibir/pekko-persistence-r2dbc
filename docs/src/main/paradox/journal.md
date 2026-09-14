@@ -65,6 +65,7 @@ pekko.persistence.r2dbc.batched-journal {
   max-queue-size = 10000 # optional, default value
   max-batch-size = 100 # optional, default value
   max-batch-time = 2ms # optional, default value
+  max-deadlock-retries = 3 # optional, default value
 }
 ```
 
@@ -78,6 +79,8 @@ The batched journal uses the following settings, in addition to the settings of 
   buffered.
 - `max-batch-time`: Maximum time a write request is buffered. If the batch does not reach `max-batch-size`
   first, it is flushed when this duration has elapsed, even if the batch holds only one request.
+- `max-deadlock-retries`: Maximum number of retries of the whole batch when a write fails with a deadlock or
+  serialization failure. Must be at least 0.
 
 ### Tradeoffs
 
@@ -91,12 +94,14 @@ Failures:
 Writes of different persistence ids share one database statement. If the database rejects a statement because of
 a single persistence id, for example a duplicate sequence number caused by a zombie writer, the batched journal
 retries the batch in halves until only the offending write fails. The other persistent actors are not affected.
-Failures that are not caused by a single persistence id, for example a lost database connection, fail all writes
-of the batch. The affected persistent actors see a journal write failure and are stopped by the default
-supervision, as with the default journal. Isolating a single offending write costs about 2 * log2(`max-batch-size`)
-additional statements; only when many writes in the batch are offending does the retry approach twice
-`max-batch-size` statements, which is the number of statements the default journal would have used for the same
-writes.
+Deadlocks and serialization failures are transient conflicts, so the batch is retried whole up to
+`max-deadlock-retries` times (default 3), mirroring how the default journal retries the failed write when the
+persistent actor restarts. Failures that are not caused by a single persistence id and are not transient, for
+example a lost database connection, fail all writes of the batch. The affected persistent actors see a journal
+write failure and are stopped by the default supervision, as with the default journal. Isolating a single
+offending write costs about 2 * log2(`max-batch-size`) additional statements; only when many writes in the batch
+are offending does the retry approach twice `max-batch-size` statements, which is the number of statements the
+default journal would have used for the same writes.
 
 Memory:
 `max-batch-size` limits the number of requests in one batch, not the number of events, and the queue is limited

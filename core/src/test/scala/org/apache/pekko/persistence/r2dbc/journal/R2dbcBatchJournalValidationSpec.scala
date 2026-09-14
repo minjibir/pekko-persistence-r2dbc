@@ -96,6 +96,20 @@ object R2dbcBatchJournalValidationSpec {
         }
       }""")
     .withFallback(TestConfig.config)
+
+  val negativeDeadlockRetriesConfig: Config = ConfigFactory
+    .parseString("""
+      pekko.persistence.r2dbc {
+        use-app-timestamp = on
+        db-timestamp-monotonic-increasing = on
+        batched-journal {
+          class = "org.apache.pekko.persistence.r2dbc.journal.R2dbcBatchJournal"
+          use-app-timestamp = on
+          db-timestamp-monotonic-increasing = on
+          max-deadlock-retries = -1
+        }
+      }""")
+    .withFallback(TestConfig.config)
 }
 
 class R2dbcBatchJournalZeroBatchSizeSpec
@@ -167,6 +181,21 @@ class R2dbcBatchJournalMonotonicIncreasingOffSpec
 
     "fail fast when db-timestamp-monotonic-increasing is off" in {
       LoggingTestKit.error("db-timestamp-monotonic-increasing must be 'on'").expect {
+        Persistence(system).journalFor("pekko.persistence.r2dbc.batched-journal")
+      }
+    }
+  }
+}
+
+class R2dbcBatchJournalNegativeDeadlockRetriesSpec
+    extends ScalaTestWithActorTestKit(R2dbcBatchJournalValidationSpec.negativeDeadlockRetriesConfig)
+    with AnyWordSpecLike
+    with LogCapturing {
+
+  "R2dbcBatchJournal validation" should {
+
+    "fail fast when max-deadlock-retries is less than 0" in {
+      LoggingTestKit.error("max-deadlock-retries must be at least 0").expect {
         Persistence(system).journalFor("pekko.persistence.r2dbc.batched-journal")
       }
     }

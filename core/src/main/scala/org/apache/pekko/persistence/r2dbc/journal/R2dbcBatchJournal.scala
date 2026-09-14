@@ -26,6 +26,7 @@ import scala.util.{ Failure, Success, Try }
 
 import com.typesafe.config.Config
 import io.r2dbc.spi.R2dbcDataIntegrityViolationException
+import io.r2dbc.spi.R2dbcException
 import org.apache.pekko
 import pekko.Done
 import pekko.actor.Timers
@@ -33,6 +34,7 @@ import pekko.actor.typed.ActorSystem
 import pekko.actor.typed.scaladsl.adapter._
 import pekko.annotation.InternalApi
 import pekko.event.Logging
+import pekko.event.LoggingAdapter
 import pekko.persistence.AtomicWrite
 import pekko.persistence.Persistence
 import pekko.persistence.PersistentRepr
@@ -59,11 +61,47 @@ private[r2dbc] object R2dbcBatchJournal {
 
   // the promise is completed with Done only after the batch containing this request is committed;
   // the AsyncWriteJournal result is derived from it at the API boundary
-  private final case class WriteRequest(
+  private[r2dbc] final case class WriteRequest(
       rows: Seq[SerializedJournalRow],
       messages: Seq[AtomicWrite],
       promise: Promise[Done]
   )
+
+  /**
+   * Deadlocks and serialization failures are reported with these SQL states. The MySQL driver reports a deadlock as
+   * `R2dbcTransientResourceException` with state 40001, the Postgres driver reports a deadlock as
+   * `R2dbcTransientException` with state 40P01 and a serialization failure as `R2dbcRollbackException` with state
+   * 40001.
+   */
+  private[r2dbc] def isDeadlock(exception: R2dbcException): Boolean =
+    exception.getSqlState match {
+      case "40001" | "40P01" => true
+      case _                 => false
+    }
+
+  /**
+   * Runs the batch with `attempt`, retrying the whole batch on deadlock and serialization failures up to
+   * `deadlockRetriesLeft` times, and halving the batch on data integrity violations so that only the offending
+   * persistence ids fail.
+   */
+  private[r2dbc] def writeBatch(
+      log: LoggingAdapter,
+      requests: Vector[WriteRequest],
+      deadlockRetriesLeft: Int)(
+      attempt: Vector[WriteRequest] => Future[Unit])(implicit ec: ExecutionContext): Future[Unit] =
+    attempt(requests).recoverWith {
+      case _: R2dbcDataIntegrityViolationException if requests.size > 1 =>
+        val (left, right) = requests.splitAt(requests.size / 2)
+        writeBatch(log, left, deadlockRetriesLeft)(attempt).flatMap(_ =>
+          writeBatch(log, right, deadlockRetriesLeft)(attempt))
+      case e: R2dbcException if deadlockRetriesLeft > 0 && isDeadlock(e) =>
+        log.debug("Batch write hit a deadlock or serialization failure, [{}] retries left",
+          deadlockRetriesLeft - 1)
+        writeBatch(log, requests, deadlockRetriesLeft - 1)(attempt)
+      case exception =>
+        requests.foreach(_.promise.tryFailure(exception))
+        Future.unit
+    }
 }
 
 /**
@@ -79,7 +117,9 @@ private[r2dbc] object R2dbcBatchJournal {
  * timestamps come from the application clock, which therefore must not move backwards.
  * The Postgres, Yugabyte, and MySQL dialects are supported. With application timestamps the
  * database-generated `db_timestamp` is never read back, so the absence of `RETURNING` in MySQL
- * does not matter.
+ * does not matter. A batch that fails with a deadlock or serialization failure is retried whole
+ * up to `max-deadlock-retries` times, because those errors are transient and the retry mirrors
+ * how the default journal retries the failed write when the persistent actor restarts.
  *
  * Writes are buffered in a bounded queue (`max-queue-size`); incoming writes are rejected with
  * a failed future once the queue is full. Flushed batches are serialized: only one batch is in
@@ -88,7 +128,8 @@ private[r2dbc] object R2dbcBatchJournal {
  * be added later if a single flush saturates.
  *
  * A batch that fails with a database integrity violation is retried in halves so that only the
- * offending persistence ids fail. Infrastructure errors fail the whole batch. A batch can contain an arbitrarily large
+ * offending persistence ids fail. Deadlocks and serialization failures are retried whole, see
+ * above. Infrastructure errors fail the whole batch. A batch can contain an arbitrarily large
  * number of rows when callers use `persistAll` or `persistAsync` bursts, the same as the default
  * journal; this plugin targets many small concurrent writes.
  */
@@ -117,10 +158,12 @@ private[r2dbc] final class R2dbcBatchJournal(config: Config) extends AsyncWriteJ
   private val maxQueueSize: Int = config.getInt("max-queue-size")
   private val maxBatchSize: Int = config.getInt("max-batch-size")
   private val maxBatchTime: FiniteDuration = config.getDuration("max-batch-time").toScala
+  private val maxDeadlockRetries: Int = config.getInt("max-deadlock-retries")
 
   require(maxQueueSize > 0, "max-queue-size must be at least 1 when using R2dbcBatchJournal")
   require(maxBatchSize > 0, "max-batch-size must be at least 1 when using R2dbcBatchJournal")
   require(maxBatchSize <= maxQueueSize, "max-batch-size must be less than or equal to `max-queue-size`")
+  require(maxDeadlockRetries >= 0, "max-deadlock-retries must be at least 0 when using R2dbcBatchJournal")
 
   private val journalDao = JournalDao.fromConfig(journalSettings, config)
 
@@ -146,23 +189,17 @@ private[r2dbc] final class R2dbcBatchJournal(config: Config) extends AsyncWriteJ
     val writeRequests = queue.take(count).toVector
     queue.dropInPlace(count)
 
-    def write(requests: Vector[WriteRequest]): Future[Unit] =
+    def attempt(requests: Vector[WriteRequest]): Future[Unit] =
       journalDao
         .writeEvents(requests.flatMap(_.rows))
         .map { _ =>
           requests.foreach(_.promise.trySuccess(Done))
           requests.foreach(w => publish(w.messages, Future.successful(w.rows.head.dbTimestamp)))
         }
-        .recoverWith {
-          case _: R2dbcDataIntegrityViolationException if requests.size > 1 =>
-            val (left, right) = requests.splitAt(requests.size / 2)
-            write(left).flatMap(_ => write(right))
-          case exception =>
-            requests.foreach(_.promise.tryFailure(exception))
-            Future.unit
-        }
 
-    write(writeRequests).onComplete(_ => if (!stopping) self ! FlushDone)
+    R2dbcBatchJournal
+      .writeBatch(log, writeRequests, maxDeadlockRetries)(attempt)
+      .onComplete(_ => if (!stopping) self ! FlushDone)
   }
 
   override def receivePluginInternal: Receive = {
