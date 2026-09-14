@@ -51,7 +51,7 @@ The batched journal requires `use-app-timestamp` and `db-timestamp-monotonic-inc
 dialect requires. With `db-timestamp-monotonic-increasing` the database does not enforce increasing timestamps per
 persistence id, so the application clock must not move backwards between two writes of the same entity. The
 backtracking queries of @ref:[eventsBySlices](query.md) recover events that were stored with an out-of-order
-timestamp. Batching is only supported for the Postgres and Yugabyte dialects.
+timestamp. Batching is supported for the Postgres, Yugabyte, and MySQL dialects.
 
 ### Batched Journal Configuration
 

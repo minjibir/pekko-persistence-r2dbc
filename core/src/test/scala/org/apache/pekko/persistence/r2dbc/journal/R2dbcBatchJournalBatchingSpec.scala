@@ -89,8 +89,7 @@ class R2dbcBatchJournalSizeFlushSpec
     with AnyWordSpecLike
     with TestDbLifecycle
     with TestData
-    with LogCapturing
-    with BatchedJournalDialectGate {
+    with LogCapturing {
   import R2dbcBatchJournalBatchingSpec.writeMessages
 
   override def typedSystem: ActorSystem[?] = system
@@ -130,8 +129,7 @@ class R2dbcBatchJournalTimerFlushSpec
     with AnyWordSpecLike
     with TestDbLifecycle
     with TestData
-    with LogCapturing
-    with BatchedJournalDialectGate {
+    with LogCapturing {
   import R2dbcBatchJournalBatchingSpec.writeMessages
 
   override def typedSystem: ActorSystem[?] = system
@@ -162,8 +160,7 @@ class R2dbcBatchJournalQueueLimitSpec
     with AnyWordSpecLike
     with TestDbLifecycle
     with TestData
-    with LogCapturing
-    with BatchedJournalDialectGate {
+    with LogCapturing {
   import R2dbcBatchJournalBatchingSpec.writeMessages
 
   override def typedSystem: ActorSystem[?] = system

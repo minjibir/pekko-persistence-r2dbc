@@ -38,7 +38,6 @@ import pekko.persistence.Persistence
 import pekko.persistence.PersistentRepr
 import pekko.persistence.journal.AsyncWriteJournal
 import pekko.persistence.journal.Tagged
-import pekko.persistence.r2dbc.Dialect.{ Postgres, Yugabyte }
 import pekko.persistence.r2dbc.JournalSettings
 import pekko.persistence.r2dbc.internal.InstantFactory
 import pekko.persistence.r2dbc.internal.PubSub
@@ -78,7 +77,9 @@ private[r2dbc] object R2dbcBatchJournal {
  * `use-app-timestamp = on` and `db-timestamp-monotonic-increasing = on`: in that mode
  * [[JournalDao]] does not bind the per-persistence-id previous sequence number subselect, and
  * timestamps come from the application clock, which therefore must not move backwards.
- * The Postgres and Yugabyte dialects are required because the flush relies on `RETURNING`.
+ * The Postgres, Yugabyte, and MySQL dialects are supported. With application timestamps the
+ * database-generated `db_timestamp` is never read back, so the absence of `RETURNING` in MySQL
+ * does not matter.
  *
  * Writes are buffered in a bounded queue (`max-queue-size`); incoming writes are rejected with
  * a failed future once the queue is full. Flushed batches are serialized: only one batch is in
@@ -87,9 +88,9 @@ private[r2dbc] object R2dbcBatchJournal {
  * be added later if a single flush saturates.
  *
  * A batch that fails with a database integrity violation is retried in halves so that only the
- * offending persistence ids fail. Infrastructure errors fail the whole batch. A batch can contain
- * an arbitrarily large number of rows when callers use `persistAll` or `persistAsync` bursts, the
- * same as the default journal; this plugin targets many small concurrent writes.
+ * offending persistence ids fail. Infrastructure errors fail the whole batch. A batch can contain an arbitrarily large
+ * number of rows when callers use `persistAll` or `persistAsync` bursts, the same as the default
+ * journal; this plugin targets many small concurrent writes.
  */
 @InternalApi
 private[r2dbc] final class R2dbcBatchJournal(config: Config) extends AsyncWriteJournal with Timers {
@@ -109,8 +110,6 @@ private[r2dbc] final class R2dbcBatchJournal(config: Config) extends AsyncWriteJ
   private val serialization: Serialization = SerializationExtension(context.system)
   private val journalSettings = JournalSettings(config)
 
-  require(journalSettings.dialect == Postgres || journalSettings.dialect == Yugabyte,
-    "Batching is only supported for Postgres and Yugabyte")
   require(journalSettings.useAppTimestamp, "use-app-timestamp must be 'on' when using R2dbcBatchJournal")
   require(journalSettings.dbTimestampMonotonicIncreasing,
     "db-timestamp-monotonic-increasing must be 'on' when using R2dbcBatchJournal")
